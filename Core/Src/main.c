@@ -87,6 +87,7 @@ static uint32_t last_led_toggle = 0;
 static adc_sample_t latest_sample = { 0 };
 static uint8_t display_page = 0; /* 0: voltage, 1: temperature */
 
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -105,7 +106,7 @@ static void App_Log(const char* fmt, ...);
 static void App_UpdateDisplay(void)
 {
   /* TODO: draw font; for now just clear and log */
-  ssd1315_fill(0x05);
+//  ssd1315_fill(0x05);
 
   if(display_page == 0) {
     App_Log("display page: voltage, vbat=%lumV, vdda=%lumV, vref=%lumV\r\n",
@@ -267,6 +268,14 @@ static void App_HandleLed(uint32_t now)
   if((now - last_led_toggle) >= APP_LED_BLINK_PERIOD_MS) {
     last_led_toggle = now;
     HAL_GPIO_TogglePin(LED_G_GPIO_Port, LED_G_Pin);
+
+    SSD1315_Clear();
+    char buff[16];
+    static float temp_c = 35.55f;
+    snprintf(buff, sizeof(buff), "%.2fo", temp_c);
+    temp_c += 0.01f;
+    SSD1315_ShowBigText(0, 0, buff, 1);
+    SSD1315_Refresh_Gram();
   }
 }
 
@@ -279,13 +288,18 @@ static void App_Init(void)
   HAL_NVIC_SetPriority(EXTI0_1_IRQn, 1, 0);
   HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
 
-  /* Init OLED */
-  if(ssd1315_init() != SSD1315_OK) {
-    App_Log("oled init failed\r\n");
-  } else {
-    App_Log("oled init ok\r\n");
-  }
+  if(SSD1315_Init() == SSD1315_OK) {
+    // // 最简单的测试：直接填充整个屏幕为白色
+    // SSD1315_FillScreen(1);
 
+    // // 保持显示状态，不刷新（FillScreen内部已刷新）
+    // HAL_Delay(5000); // 显示5秒
+
+    // // 如果全屏白色显示正常，再尝试显示字符串
+    SSD1315_Clear();
+    SSD1315_Refresh_Gram();
+    // HAL_Delay(500); // 短暂延时
+  }
   /* Start an initial ADC sampling */
   App_SampleAdc();
 
