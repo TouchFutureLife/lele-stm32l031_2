@@ -44,4 +44,5 @@ lele-stm32l031\main.o: ../Core/Inc/usart.h
 lele-stm32l031\main.o: ../Core/Inc/gpio.h
 lele-stm32l031\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdio.h
 lele-stm32l031\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\stdarg.h
+lele-stm32l031\main.o: C:\Keil_v5\ARM\ARMCC\Bin\..\include\math.h
 lele-stm32l031\main.o: ../Core/Inc/oled.h

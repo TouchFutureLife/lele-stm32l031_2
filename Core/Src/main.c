@@ -30,6 +30,7 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <stdarg.h>
+#include <math.h>
 #include "oled.h"
 /* USER CODE END Includes */
 
@@ -43,7 +44,9 @@ typedef struct {
   uint32_t vdda_mv;
   uint32_t vbat_mv;
   uint32_t vref_mv;
+  uint32_t temp_ext_c_pt1000_mv;
   int32_t  temp_int_c_x100; /* hundredths of deg C */
+  int32_t  temp_ext_c_x100; /* hundredths of deg C, computed from pt1000 */
 } adc_sample_t;
 /* USER CODE END PTD */
 
@@ -61,6 +64,10 @@ typedef struct {
 #define ADC_DMA_SAMPLES           8U
 #define EMA_ALPHA_NUM             1U
 #define EMA_ALPHA_DEN             4U
+
+#define ADC_REF_VOLTAGE             VREF_EXT_MV
+#define APP_ADC_PERIOD_MS           2000U  // trigger ADC every 2000ms for slower PT1000 response
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,7 +81,7 @@ typedef struct {
 static volatile uint16_t adc_dma_buf[ADC_CHANNEL_COUNT * ADC_DMA_SAMPLES];
 static volatile uint8_t adc_busy = 0;
 static volatile uint8_t adc_ready = 0;
-static uint8_t adc_filter_init = 0;
+// adc_filter_init reserved for future smoothing; unused currently
 
 static volatile uint8_t rtc_wakeup_flag = 0;
 static volatile uint8_t button_irq_flag = 0;
@@ -84,6 +91,7 @@ static uint8_t button_short_press = 0;
 static uint8_t button_long_press = 0;
 
 static uint32_t last_led_toggle = 0;
+static uint32_t last_adc_trigger = 0;
 static adc_sample_t latest_sample = { 0 };
 static uint8_t display_page = 0; /* 0: voltage, 1: temperature */
 
@@ -103,22 +111,191 @@ static void App_Log(const char* fmt, ...);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// -------------------------- 1. 各温度对应的阻值数组（基于您提供的矩阵数据） --------------------------
+// 32℃对应的阻值列表
+static const float pt1000_32[] = {
+    1124.474, 1124.861, 1125.248, 1125.636, 1126.023,
+    1126.41,  1126.797, 1127.184, 1127.571, 1127.958
+};
+
+// 33℃对应的阻值列表
+static const float pt1000_33[] = {
+  1128.345, 1128.732, 1129.119, 1129.893, 1130.127,
+  1130.28,  1130.667, 1131.054, 1131.441, 1131.82
+};
+
+// 34℃对应的阻值列表
+static const float pt1000_34[] = {
+    1132.215, 1132.602, 1132.988, 1133.375, 1133.762,
+    1134.149, 1134.536, 1134.923, 1135.309, 1135.69
+};
+
+// 35℃对应的阻值列表
+static const float pt1000_35[] = {
+    1136.083, 1136.47,  1136.857, 1137.243, 1137.63,
+    1138.017, 1138.404, 1138.79,  1139.177, 1139.564
+};
+
+// 36℃对应的阻值列表
+static const float pt1000_36[] = {
+    1139.95,  1140.337, 1140.724, 1141.11,  1141.497,
+    1141.884, 1142.27,  1142.657, 1143.043, 1143.43
+};
+
+// 37℃对应的阻值列表
+static const float pt1000_37[] = {
+    1143.817, 1144.203, 1144.59,  1144.976, 1145.363,
+    1145.749, 1146.136, 1146.522, 1146.909, 1147.295
+};
+
+// 38℃对应的阻值列表
+static const float pt1000_38[] = {
+    1147.681, 1148.068, 1148.454, 1148.841, 1149.227,
+    1149.614, 1150.0,   1150.386, 1150.773, 1151.159
+};
+
+// 39℃对应的阻值列表
+static const float pt1000_39[] = {
+    1151.545, 1151.932, 1152.318, 1152.704, 1153.091,
+    1153.477, 1153.86,  1154.249, 1154.636, 1155.02
+};
+
+// 40℃对应的阻值列表
+static const float pt1000_40[] = {
+    1155.408, 1155.794, 1156.18,  1156.567, 1156.953,
+    1157.339, 1157.725, 1158.111, 1158.497, 1158.883
+};
+
+// 41℃对应的阻值列表
+static const float pt1000_41[] = {
+    1159.27,  1159.656, 1160.042, 1160.428, 1160.814,
+    1161.2,   1161.586, 1161.972, 1162.358, 1162.744
+};
+
+// 42℃对应的阻值列表
+static const float pt1000_42[] = {
+    1163.13,  1163.516, 1163.902, 1164.288, 1164.674,
+    1165.06,  1165.446, 1165.831, 1166.217, 1166.6
+};
+
+// 43℃对应的阻值列表
+static const float pt1000_43[] = {
+    1166.989, 1167.376, 1167.761, 1168.147, 1168.532,
+    1168.918, 1169.304, 1169.69,  1170.076, 1170.46
+};
+
+// 44℃对应的阻值列表
+static const float pt1000_44[] = {
+    1170.847, 1171.233, 1171.619, 1172.004, 1172.39,
+    1172.776, 1173.161, 1173.547, 1173.933, 1174.318
+};
+
+// 45℃对应的阻值列表
+static const float pt1000_45[] = {
+    1174.704, 1175.09,  1175.475, 1175.861, 1176.247,
+    1176.632, 1177.018, 1177.403, 1177.789, 1178.174
+};
+
+
+// -------------------------- 2. 温度-阻值数组映射表（核心关联结构） --------------------------
+typedef struct {
+  int8_t temp;               // 温度（℃，32~45）
+  const float* resistances;  // 对应温度的阻值数组
+  uint8_t res_count;         // 阻值数组的元素数量
+} PT1000_TempResMap;
+
+// 32℃~45℃ 温度-阻值映射表（整合上述数组）
+const PT1000_TempResMap pt1000_temp_res_map[] = {
+    {32, pt1000_32, sizeof(pt1000_32) / sizeof(float)},
+    {33, pt1000_33, sizeof(pt1000_33) / sizeof(float)},
+    {34, pt1000_34, sizeof(pt1000_34) / sizeof(float)},
+    {35, pt1000_35, sizeof(pt1000_35) / sizeof(float)},
+    {36, pt1000_36, sizeof(pt1000_36) / sizeof(float)},
+    {37, pt1000_37, sizeof(pt1000_37) / sizeof(float)},
+    {38, pt1000_38, sizeof(pt1000_38) / sizeof(float)},
+    {39, pt1000_39, sizeof(pt1000_39) / sizeof(float)},
+    {40, pt1000_40, sizeof(pt1000_40) / sizeof(float)},
+    {41, pt1000_41, sizeof(pt1000_41) / sizeof(float)},
+    {42, pt1000_42, sizeof(pt1000_42) / sizeof(float)},
+    {43, pt1000_43, sizeof(pt1000_43) / sizeof(float)},
+    {44, pt1000_44, sizeof(pt1000_44) / sizeof(float)},
+    {45, pt1000_45, sizeof(pt1000_45) / sizeof(float)}
+};
+
+// 映射表的总条目数（自动计算，避免硬编码错误）
+#define PT1000_MAP_ENTRY_COUNT (sizeof(pt1000_temp_res_map) / sizeof(PT1000_TempResMap))
+
+// -------------------------- 2. 核心函数：阻值转温度（0.1℃精度） --------------------------
+/**
+ * @brief 阻值转温度（精度0.1℃）
+ * @param target_res: 采样的PT1000阻值（Ω）
+ * @return 温度值（℃，保留1位小数）；返回-999.0表示阻值超出32~45℃对应范围
+ */
+float pt1000_res_to_temp_01deg(const float target_res)
+{
+  // 定义相邻原始点（R_prev/T_prev：前一个0.1℃步进点；R_next/T_next：后一个0.1℃步进点）
+  float R_prev = 0.0f, T_prev = 0.0f;
+  float R_next = 0.0f, T_next = 0.0f;
+  // 全局遍历所有原始阻值点，找到目标阻值的相邻区间
+  for(uint8_t i = 0; i < PT1000_MAP_ENTRY_COUNT; i++) {
+    const PT1000_TempResMap* entry = &pt1000_temp_res_map[i];
+    for(uint8_t j = 0; j < entry->res_count; j++) {
+      float current_R = entry->resistances[j];
+      // 原始点的温度：基准温度 + j×0.1℃（如32.0 + 0×0.1=32.00，32.0+1×0.1=32.10...）
+      float current_T = entry->temp + (j * 0.1f);
+
+      // 1. 精准匹配原始点：直接返回0.01℃精度的温度（无插值）
+      if(fabs(current_R - target_res) < 1e-6) {  // 浮点精度容错（1e-6Ω）
+        return roundf(current_T * 100) / 100;  // 强制保留2位小数
+      }
+
+      // 2. 更新前一个点（≤目标阻值的最大阻值点）
+      if(current_R <= target_res && current_R > R_prev) {
+        R_prev = current_R;
+        T_prev = current_T;
+      }
+
+      // 3. 更新后一个点（≥目标阻值的最小阻值点）
+      if(current_R >= target_res) {
+        if(R_next == 0.0f || current_R < R_next) {
+          R_next = current_R;
+          T_next = current_T;
+        }
+      }
+    }
+  }
+
+  // 校验：阻值超出32~45℃范围（无有效相邻点）
+  if(R_prev == 0.0f || R_next == 0.0f) {
+    return -999.00f;
+  }
+
+  // 4. 二级线性插值：在0.1℃区间内细分到0.01℃
+  // 公式：Tx = T_prev + (T_next - T_prev) × (Rx - R_prev)/(R_next - R_prev)
+  // T_next - T_prev = 0.1℃，因此结果会自然细分到0.01℃
+  float temp_delta = T_next - T_prev;       // 固定为0.1℃（原始点步进）
+  float res_delta = R_next - R_prev;        // 原始点的阻值差
+  if(res_delta <= 0.0f) {
+    return -999.00f; // 数据异常（非递增或重复）
+  }
+  float res_offset = target_res - R_prev;   // 目标阻值相对前一个点的偏移
+  float interpolated_T = T_prev + (temp_delta * res_offset) / res_delta;
+
+  // 5. 四舍五入保留2位小数（确保0.01℃精度，避免浮点误差）
+  interpolated_T = roundf(interpolated_T * 100) / 100;
+
+
+  return interpolated_T;
+}
+
 static void App_UpdateDisplay(void)
 {
   /* TODO: draw font; for now just clear and log */
-//  ssd1315_fill(0x05);
-
-  if(display_page == 0) {
-    App_Log("display page: voltage, vbat=%lumV, vdda=%lumV, vref=%lumV\r\n",
-      (unsigned long)latest_sample.vbat_mv,
-      (unsigned long)latest_sample.vdda_mv,
-      (unsigned long)latest_sample.vref_mv);
-  } else {
-    App_Log("display page: temperature, int=%ld.%02ldC ext_raw=%u\r\n",
-                (long)(latest_sample.temp_int_c_x100 / 100),
-                (long)(latest_sample.temp_int_c_x100 % 100),
-                latest_sample.raw_ext_temp);
-  }
+  SSD1315_Clear();
+  char buff[16];
+  snprintf(buff, sizeof(buff), "%.2fo", latest_sample.temp_ext_c_x100 * 0.01f);
+  SSD1315_ShowBigText(1, 8, buff, 1);
+  SSD1315_Refresh_Gram();
 }
 
 static void App_Log(const char* fmt, ...)
@@ -216,6 +393,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc_handle)
 
   sample.vbat_mv = (uint32_t)sample.raw_vbat * sample.vdda_mv * 2 / ADC_FULL_SCALE;
   sample.temp_int_c_x100 = App_ComputeInternalTempC_x100(sample.raw_int_temp, sample.vdda_mv);
+  sample.temp_ext_c_pt1000_mv = (uint32_t)sample.raw_ext_temp * sample.vdda_mv / ADC_FULL_SCALE;
 
   /* Simple EMA to smooth noise */
   latest_sample.raw_vbat = sample.raw_vbat;
@@ -226,6 +404,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc_handle)
   latest_sample.vbat_mv = sample.vbat_mv;
   latest_sample.vref_mv = VREF_EXT_MV;
   latest_sample.temp_int_c_x100 = sample.temp_int_c_x100;
+  latest_sample.temp_ext_c_pt1000_mv = sample.temp_ext_c_pt1000_mv;
 
   adc_ready = 1;
   adc_busy = 0;
@@ -268,14 +447,6 @@ static void App_HandleLed(uint32_t now)
   if((now - last_led_toggle) >= APP_LED_BLINK_PERIOD_MS) {
     last_led_toggle = now;
     HAL_GPIO_TogglePin(LED_G_GPIO_Port, LED_G_Pin);
-
-    SSD1315_Clear();
-    char buff[16];
-    static float temp_c = 35.55f;
-    snprintf(buff, sizeof(buff), "%.2fo", temp_c);
-    temp_c += 0.01f;
-    SSD1315_ShowBigText(0, 0, buff, 1);
-    SSD1315_Refresh_Gram();
   }
 }
 
@@ -289,16 +460,8 @@ static void App_Init(void)
   HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
 
   if(SSD1315_Init() == SSD1315_OK) {
-    // // 最简单的测试：直接填充整个屏幕为白色
-    // SSD1315_FillScreen(1);
-
-    // // 保持显示状态，不刷新（FillScreen内部已刷新）
-    // HAL_Delay(5000); // 显示5秒
-
-    // // 如果全屏白色显示正常，再尝试显示字符串
     SSD1315_Clear();
     SSD1315_Refresh_Gram();
-    // HAL_Delay(500); // 短暂延时
   }
   /* Start an initial ADC sampling */
   App_SampleAdc();
@@ -314,9 +477,21 @@ static void App_Run(void)
   App_HandleButton();
   App_HandleLed(now);
 
+  // Faster periodic ADC trigger for PT1000 responsiveness
+  if((now - last_adc_trigger) >= APP_ADC_PERIOD_MS) {
+    last_adc_trigger = now;
+    App_SampleAdc();
+  }
+
   if(adc_ready) {
     adc_ready = 0;
-    App_Log("adc: vbat_raw=%u vref_raw=%u ext_raw=%u int_raw=%u vdda=%lumV vbat=%lumV vref=%lumV tint=%ld.%02ldC\r\n",
+
+    float tmp_res = (latest_sample.raw_ext_temp * 1.0f / latest_sample.raw_vref) * 1000.0f / 82 + 1136;
+    float temperature = pt1000_res_to_temp_01deg(tmp_res);
+    //temperature转换到temp_ext_c_x100
+    latest_sample.temp_ext_c_x100 = (int32_t)(temperature * 100);
+
+    App_Log("adc: vbat_raw=%u vref_raw=%u ext_raw=%u int_raw=%u vdda=%lumV vbat=%lumV vref=%lumV ext_temp_mv=%lumV ext_temp=%ld.%02ldC tint=%ld.%02ldC\r\n",
             latest_sample.raw_vbat,
             latest_sample.raw_vref,
             latest_sample.raw_ext_temp,
@@ -324,10 +499,12 @@ static void App_Run(void)
             (unsigned long)latest_sample.vdda_mv,
             (unsigned long)latest_sample.vbat_mv,
               (unsigned long)latest_sample.vref_mv,
+            (unsigned long)latest_sample.temp_ext_c_pt1000_mv,
+            (long)(latest_sample.temp_ext_c_x100 / 100),
+            (long)(latest_sample.temp_ext_c_x100 % 100),
             (long)(latest_sample.temp_int_c_x100 / 100),
             (long)(latest_sample.temp_int_c_x100 % 100));
     App_UpdateDisplay();
-    // App_SampleAdc();
   }
 
   if(rtc_wakeup_flag) {
@@ -339,16 +516,18 @@ static void App_Run(void)
     button_short_press = 0;
     display_page ^= 1U;
     App_Log("button short: toggle page=%u\r\n", display_page);
-    // App_UpdateDisplay();
+    App_UpdateDisplay();
   }
 
   if(button_long_press) {
     button_long_press = 0;
     App_Log("button long: no-op placeholder\r\n");
+    if(HAL_GPIO_ReadPin(GPIOA, POWER_CTL_Pin) == GPIO_PIN_SET) {
+      HAL_GPIO_WritePin(GPIOA, POWER_CTL_Pin, GPIO_PIN_RESET);
+      App_Log("power off\r\n");
+    }
   }
 }
-
-
 
 /* USER CODE END 0 */
 
@@ -360,7 +539,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  HAL_GPIO_WritePin(GPIOA, POWER_CTL_Pin, GPIO_PIN_SET);
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
