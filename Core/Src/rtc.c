@@ -21,6 +21,7 @@
 #include "rtc.h"
 
 /* USER CODE BEGIN 0 */
+#define APP_RTC_WAKEUP_PERIOD_S 4U
 
 /* USER CODE END 0 */
 
@@ -53,13 +54,12 @@ void MX_RTC_Init(void)
     Error_Handler();
   }
 
-  /** Enable the WakeUp
-  */
-  if (HAL_RTCEx_SetWakeUpTimer(&hrtc, 10, RTC_WAKEUPCLOCK_CK_SPRE_16BITS) != HAL_OK)
+  /* USER CODE BEGIN RTC_Init 2 */
+  HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
+  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, APP_RTC_WAKEUP_PERIOD_S - 1U, RTC_WAKEUPCLOCK_CK_SPRE_16BITS) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN RTC_Init 2 */
 
   /* USER CODE END RTC_Init 2 */
 
@@ -76,6 +76,8 @@ void HAL_RTC_MspInit(RTC_HandleTypeDef* rtcHandle)
     /* RTC clock enable */
     __HAL_RCC_RTC_ENABLE();
   /* USER CODE BEGIN RTC_MspInit 1 */
+    HAL_NVIC_SetPriority(RTC_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(RTC_IRQn);
 
   /* USER CODE END RTC_MspInit 1 */
   }

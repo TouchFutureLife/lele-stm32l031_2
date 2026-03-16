@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
+#include <stdlib.h>
 #include "oled.h"
 /* USER CODE END Includes */
 
@@ -53,8 +54,6 @@ typedef struct {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define APP_LED_BLINK_PERIOD_MS   1000U
-#define BUTTON_DEBOUNCE_MS        50U
-#define BUTTON_LONG_PRESS_MS      1500U
 #define VREF_EXT_MV               1250U
 #define ADC_FULL_SCALE            4095U
 #define TS_CAL1_ADDR              ((uint16_t *)0x1FF8007A)
@@ -66,7 +65,11 @@ typedef struct {
 #define EMA_ALPHA_DEN             4U
 
 #define ADC_REF_VOLTAGE             VREF_EXT_MV
-#define APP_ADC_PERIOD_MS           2000U  // trigger ADC every 2000ms for slower PT1000 response
+#define DISPLAY_ENABLE              1U
+#define APP_KEY_WAKEUP_ENABLE       0U
+#define TEMP_WEAR_ON_THRESHOLD_X100 3500
+#define TEMP_WEAR_OFF_THRESHOLD_X100 3450
+#define INVALID_TEMP_X100           (-99900)
 
 /* USER CODE END PD */
 
@@ -84,16 +87,15 @@ static volatile uint8_t adc_ready = 0;
 // adc_filter_init reserved for future smoothing; unused currently
 
 static volatile uint8_t rtc_wakeup_flag = 0;
-static volatile uint8_t button_irq_flag = 0;
-static uint8_t button_pressed = 0;
-static uint32_t button_press_tick = 0;
-static uint8_t button_short_press = 0;
-static uint8_t button_long_press = 0;
 
 static uint32_t last_led_toggle = 0;
-static uint32_t last_adc_trigger = 0;
 static adc_sample_t latest_sample = { 0 };
-static uint8_t display_page = 0; /* 0: voltage, 1: temperature */
+static int32_t peak_temp_c_x100 = INVALID_TEMP_X100;
+static uint8_t peak_temp_valid = 0;
+static uint8_t wear_state_on_body = 0;
+#if DISPLAY_ENABLE
+static int32_t display_temp_c_x100 = INVALID_TEMP_X100;
+#endif
 
 
 /* USER CODE END PV */
@@ -104,6 +106,14 @@ void SystemClock_Config(void);
 static void App_SampleAdc(void);
 static int32_t App_ComputeInternalTempC_x100(uint16_t raw_ts, uint32_t vdda_mv);
 static void App_Log(const char* fmt, ...);
+#if DISPLAY_ENABLE
+static void App_UpdateDisplay(void);
+#endif
+static void App_UpdateWearState(int32_t temp_c_x100);
+#if DISPLAY_ENABLE
+static int32_t App_GetDisplayTemp(void);
+#endif
+static void App_EnterStopMode(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -288,15 +298,44 @@ float pt1000_res_to_temp_01deg(const float target_res)
   return interpolated_T;
 }
 
+#if DISPLAY_ENABLE
 static void App_UpdateDisplay(void)
 {
-  /* TODO: draw font; for now just clear and log */
   SSD1315_Clear();
   char buff[16];
-  snprintf(buff, sizeof(buff), "%.2fo", latest_sample.temp_ext_c_x100 * 0.01f);
+  snprintf(buff, sizeof(buff), "%.2fo", display_temp_c_x100 * 0.01f);
   SSD1315_ShowBigText(1, 8, buff, 1);
   SSD1315_Refresh_Gram();
 }
+#endif
+
+static void App_UpdateWearState(int32_t temp_c_x100)
+{
+  if(wear_state_on_body) {
+    if(temp_c_x100 <= TEMP_WEAR_OFF_THRESHOLD_X100) {
+      wear_state_on_body = 0;
+    }
+  } else {
+    if(temp_c_x100 >= TEMP_WEAR_ON_THRESHOLD_X100) {
+      wear_state_on_body = 1;
+    }
+  }
+}
+
+#if DISPLAY_ENABLE
+static int32_t App_GetDisplayTemp(void)
+{
+  if(wear_state_on_body) {
+    return latest_sample.temp_ext_c_x100;
+  }
+
+  if(peak_temp_valid) {
+    return peak_temp_c_x100;
+  }
+
+  return latest_sample.temp_ext_c_x100;
+}
+#endif
 
 static void App_Log(const char* fmt, ...)
 {
@@ -410,38 +449,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc_handle)
   adc_busy = 0;
 }
 
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-  if(GPIO_Pin == PWRKEYIN_Pin) {
-    button_irq_flag = 1;
-  }
-}
-static void App_HandleButton(void)
-{
-  if(button_irq_flag) {
-    button_irq_flag = 0;
-    if(!button_pressed) {
-      button_pressed = 1;
-      button_press_tick = HAL_GetTick();
-    }
-  }
-
-  if(button_pressed) {
-    /* If released */
-    if(HAL_GPIO_ReadPin(PWRKEYIN_GPIO_Port, PWRKEYIN_Pin) == GPIO_PIN_SET) {
-      uint32_t duration = HAL_GetTick() - button_press_tick;
-      button_pressed = 0;
-      if(duration >= BUTTON_DEBOUNCE_MS) {
-        if(duration >= BUTTON_LONG_PRESS_MS) {
-          button_long_press = 1;
-        } else {
-          button_short_press = 1;
-        }
-      }
-    }
-  }
-}
-
 static void App_HandleLed(uint32_t now)
 {
   if((now - last_led_toggle) >= APP_LED_BLINK_PERIOD_MS) {
@@ -452,17 +459,33 @@ static void App_HandleLed(uint32_t now)
 
 static void App_Init(void)
 {
+  GPIO_InitTypeDef gpio_init = { 0 };
+
   /* Latch external power */
   HAL_GPIO_WritePin(POWER_CTL_GPIO_Port, POWER_CTL_Pin, GPIO_PIN_SET);
 
-  /* Enable EXTI for PWRKEYIN (PA1 on EXTI1) */
-  HAL_NVIC_SetPriority(EXTI0_1_IRQn, 1, 0);
+  /* Select wake-up source policy at runtime init. */
+#if (APP_KEY_WAKEUP_ENABLE == 0U)
+  /* RTC is the only wake-up source. */
+  HAL_NVIC_DisableIRQ(EXTI0_1_IRQn);
+  gpio_init.Pin = PWRKEYIN_Pin;
+  gpio_init.Mode = GPIO_MODE_INPUT;
+  gpio_init.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(PWRKEYIN_GPIO_Port, &gpio_init);
+  __HAL_GPIO_EXTI_CLEAR_IT(PWRKEYIN_Pin);
+#else
+  /* Keep key EXTI as an additional wake-up source. */
+  __HAL_GPIO_EXTI_CLEAR_IT(PWRKEYIN_Pin);
+  HAL_NVIC_ClearPendingIRQ(EXTI0_1_IRQn);
   HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
+#endif
 
+#if DISPLAY_ENABLE
   if(SSD1315_Init() == SSD1315_OK) {
     SSD1315_Clear();
     SSD1315_Refresh_Gram();
   }
+#endif
   /* Start an initial ADC sampling */
   App_SampleAdc();
 
@@ -474,14 +497,7 @@ static void App_Run(void)
 {
   uint32_t now = HAL_GetTick();
 
-  App_HandleButton();
   App_HandleLed(now);
-
-  // Faster periodic ADC trigger for PT1000 responsiveness
-  if((now - last_adc_trigger) >= APP_ADC_PERIOD_MS) {
-    last_adc_trigger = now;
-    App_SampleAdc();
-  }
 
   if(adc_ready) {
     adc_ready = 0;
@@ -491,20 +507,25 @@ static void App_Run(void)
     //temperature转换到temp_ext_c_x100
     latest_sample.temp_ext_c_x100 = (int32_t)(temperature * 100);
 
-    App_Log("adc: vbat_raw=%u vref_raw=%u ext_raw=%u int_raw=%u vdda=%lumV vbat=%lumV vref=%lumV ext_temp_mv=%lumV ext_temp=%ld.%02ldC tint=%ld.%02ldC\r\n",
-            latest_sample.raw_vbat,
-            latest_sample.raw_vref,
-            latest_sample.raw_ext_temp,
-            latest_sample.raw_int_temp,
-            (unsigned long)latest_sample.vdda_mv,
-            (unsigned long)latest_sample.vbat_mv,
-              (unsigned long)latest_sample.vref_mv,
-            (unsigned long)latest_sample.temp_ext_c_pt1000_mv,
+    if(latest_sample.temp_ext_c_x100 > INVALID_TEMP_X100) {
+      App_UpdateWearState(latest_sample.temp_ext_c_x100);
+      if(!peak_temp_valid || latest_sample.temp_ext_c_x100 > peak_temp_c_x100) {
+        peak_temp_c_x100 = latest_sample.temp_ext_c_x100;
+        peak_temp_valid = 1;
+      }
+    }
+
+    App_Log("adc: ext=%ld.%02ldC peak=%ld.%02ldC wear=%u vbat=%lumV\r\n",
             (long)(latest_sample.temp_ext_c_x100 / 100),
-            (long)(latest_sample.temp_ext_c_x100 % 100),
-            (long)(latest_sample.temp_int_c_x100 / 100),
-            (long)(latest_sample.temp_int_c_x100 % 100));
+            (long)labs(latest_sample.temp_ext_c_x100 % 100),
+            (long)(peak_temp_c_x100 / 100),
+            (long)labs(peak_temp_c_x100 % 100),
+            (unsigned int)wear_state_on_body,
+            (unsigned long)latest_sample.vbat_mv);
+#if DISPLAY_ENABLE
+  display_temp_c_x100 = App_GetDisplayTemp();
     App_UpdateDisplay();
+#endif
   }
 
   if(rtc_wakeup_flag) {
@@ -512,20 +533,23 @@ static void App_Run(void)
     App_SampleAdc();
   }
 
-  if(button_short_press) {
-    button_short_press = 0;
-    display_page ^= 1U;
-    App_Log("button short: toggle page=%u\r\n", display_page);
-    App_UpdateDisplay();
+  if(!adc_busy && !adc_ready && !rtc_wakeup_flag) {
+    App_EnterStopMode();
   }
+}
 
-  if(button_long_press) {
-    button_long_press = 0;
-    App_Log("button long: no-op placeholder\r\n");
-    if(HAL_GPIO_ReadPin(GPIOA, POWER_CTL_Pin) == GPIO_PIN_SET) {
-      HAL_GPIO_WritePin(GPIOA, POWER_CTL_Pin, GPIO_PIN_RESET);
-      App_Log("power off\r\n");
-    }
+static void App_EnterStopMode(void)
+{
+  HAL_SuspendTick();
+  HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+  SystemClock_Config();
+  HAL_ResumeTick();
+}
+
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef* hrtc_handle)
+{
+  if(hrtc_handle == &hrtc) {
+    rtc_wakeup_flag = 1;
   }
 }
 
@@ -567,7 +591,7 @@ int main(void)
   MX_RTC_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  App_Init();
+    App_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */

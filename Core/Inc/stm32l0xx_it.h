@@ -55,6 +55,7 @@ void DMA1_Channel1_IRQHandler(void);
 void ADC1_COMP_IRQHandler(void);
 void LPTIM1_IRQHandler(void);
 /* USER CODE BEGIN EFP */
+void RTC_IRQHandler(void);
 
 /* USER CODE END EFP */
 

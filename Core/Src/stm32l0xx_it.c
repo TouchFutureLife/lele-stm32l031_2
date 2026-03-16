@@ -59,6 +59,7 @@ extern DMA_HandleTypeDef hdma_adc;
 extern ADC_HandleTypeDef hadc;
 extern LPTIM_HandleTypeDef hlptim1;
 /* USER CODE BEGIN EV */
+extern RTC_HandleTypeDef hrtc;
 
 /* USER CODE END EV */
 
@@ -183,6 +184,11 @@ void LPTIM1_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+void RTC_IRQHandler(void)
+{
+  HAL_RTCEx_WakeUpTimerIRQHandler(&hrtc);
+}
+
 void EXTI0_1_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI0_1_IRQn 0 */
