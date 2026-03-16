@@ -1,0 +1,57 @@
+# Compiled/Object files
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.axf
+
+# Listings and debug info
+*.lst
+*.d
+*.sct
+*.sfd
+*.lnp
+
+# MDK-ARM project files
+*.uvprojx
+*.uvoptx
+*.uvguix.*
+*.scvd
+
+# MDK-ARM build directories
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+MDK-ARM/lele-stm32l031/
+
+# J-Link log files
+MDK-ARM/JLinkLog.txt
+MDK-ARM/JLinkSettings.ini
+
+# VS Code
+.vscode/
+
+# CubeMX generated files
+*.ioc
+*.mxproject
+.mxproject
+
+# Temporary files
+*~
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# OS generated files
+Thumbs.db
+desktop.ini
+
+# Build artifacts
+*.d
+*.dep
+
+# STM32 CubeMX specific
+*.gpdsc
+*.pdsc
