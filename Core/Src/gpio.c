@@ -66,7 +66,7 @@ void MX_GPIO_Init(void)
   /*Configure GPIO pin : PWRKEYIN_Pin */
   GPIO_InitStruct.Pin = PWRKEYIN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;  // 启用内部上拉
   HAL_GPIO_Init(PWRKEYIN_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : POWER_CTL_Pin LED_G_Pin */

@@ -21,7 +21,7 @@
 #include "rtc.h"
 
 /* USER CODE BEGIN 0 */
-#define APP_RTC_WAKEUP_PERIOD_S 4U
+#define APP_RTC_WAKEUP_PERIOD_S 10U
 
 /* USER CODE END 0 */
 

@@ -28,6 +28,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
@@ -54,6 +55,9 @@ typedef struct {
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define APP_LED_BLINK_PERIOD_MS   1000U
+#define BUTTON_DEBOUNCE_MS        50U
+#define BUTTON_LONG_PRESS_MS      3000U
+#define WAKEUP_TIMEOUT_MS         5000U
 #define VREF_EXT_MV               1250U
 #define ADC_FULL_SCALE            4095U
 #define TS_CAL1_ADDR              ((uint16_t *)0x1FF8007A)
@@ -66,9 +70,9 @@ typedef struct {
 
 #define ADC_REF_VOLTAGE             VREF_EXT_MV
 #define DISPLAY_ENABLE              1U
-#define APP_KEY_WAKEUP_ENABLE       0U
-#define TEMP_WEAR_ON_THRESHOLD_X100 3500
-#define TEMP_WEAR_OFF_THRESHOLD_X100 3450
+#define APP_KEY_WAKEUP_ENABLE       1U
+#define TEMP_WEAR_ON_THRESHOLD_X100 3600
+#define TEMP_WEAR_OFF_THRESHOLD_X100 3550
 #define INVALID_TEMP_X100           (-99900)
 
 /* USER CODE END PD */
@@ -87,8 +91,15 @@ static volatile uint8_t adc_ready = 0;
 // adc_filter_init reserved for future smoothing; unused currently
 
 static volatile uint8_t rtc_wakeup_flag = 0;
+static volatile uint8_t button_irq_flag = 0;
+static volatile uint8_t wakeup_source = 0;  // 0=unknown, 1=RTC, 2=button
+static uint8_t button_pressed = 0;
+static uint8_t button_short_press = 0;
+static uint8_t button_long_press = 0;
+static uint32_t button_press_tick = 0;
 
 static uint32_t last_led_toggle = 0;
+static uint32_t last_wakeup_tick = 0;
 static adc_sample_t latest_sample = { 0 };
 static int32_t peak_temp_c_x100 = INVALID_TEMP_X100;
 static uint8_t peak_temp_valid = 0;
@@ -311,6 +322,8 @@ static void App_UpdateDisplay(void)
 
 static void App_UpdateWearState(int32_t temp_c_x100)
 {
+  uint8_t old_wear_state = wear_state_on_body;
+
   if(wear_state_on_body) {
     if(temp_c_x100 <= TEMP_WEAR_OFF_THRESHOLD_X100) {
       wear_state_on_body = 0;
@@ -319,6 +332,12 @@ static void App_UpdateWearState(int32_t temp_c_x100)
     if(temp_c_x100 >= TEMP_WEAR_ON_THRESHOLD_X100) {
       wear_state_on_body = 1;
     }
+  }
+
+  // 重新检测到在体时，清除旧峰值，重新开始锁存
+  if(!old_wear_state && wear_state_on_body) {
+    peak_temp_c_x100 = INVALID_TEMP_X100;
+    peak_temp_valid = 0;
   }
 }
 
@@ -457,12 +476,44 @@ static void App_HandleLed(uint32_t now)
   }
 }
 
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if(GPIO_Pin == PWRKEYIN_Pin) {
+    button_irq_flag = 1;
+    wakeup_source = 2;  // button wake-up
+    last_wakeup_tick = HAL_GetTick();
+  }
+}
+
+static void App_HandleButton(void)
+{
+  if(button_irq_flag) {
+    button_irq_flag = 0;
+    if(!button_pressed) {
+      button_pressed = 1;
+      button_press_tick = HAL_GetTick();
+    }
+  }
+
+  if(button_pressed) {
+    /* If released */
+    if(HAL_GPIO_ReadPin(PWRKEYIN_GPIO_Port, PWRKEYIN_Pin) == GPIO_PIN_SET) {
+      uint32_t duration = HAL_GetTick() - button_press_tick;
+      button_pressed = 0;
+      if(duration >= BUTTON_DEBOUNCE_MS) {
+        if(duration >= BUTTON_LONG_PRESS_MS) {
+          button_long_press = 1;
+        } else {
+          button_short_press = 1;
+        }
+      }
+    }
+  }
+}
+
 static void App_Init(void)
 {
   GPIO_InitTypeDef gpio_init = { 0 };
-
-  /* Latch external power */
-  HAL_GPIO_WritePin(POWER_CTL_GPIO_Port, POWER_CTL_Pin, GPIO_PIN_SET);
 
   /* Select wake-up source policy at runtime init. */
 #if (APP_KEY_WAKEUP_ENABLE == 0U)
@@ -470,7 +521,7 @@ static void App_Init(void)
   HAL_NVIC_DisableIRQ(EXTI0_1_IRQn);
   gpio_init.Pin = PWRKEYIN_Pin;
   gpio_init.Mode = GPIO_MODE_INPUT;
-  gpio_init.Pull = GPIO_NOPULL;
+  gpio_init.Pull = GPIO_PULLUP;  // 启用上拉
   HAL_GPIO_Init(PWRKEYIN_GPIO_Port, &gpio_init);
   __HAL_GPIO_EXTI_CLEAR_IT(PWRKEYIN_Pin);
 #else
@@ -489,6 +540,9 @@ static void App_Init(void)
   /* Start an initial ADC sampling */
   App_SampleAdc();
 
+  /* 记录启动时间，用于5秒后自动进入睡眠 */
+  last_wakeup_tick = HAL_GetTick();
+
   /* Log boot */
   App_Log("boot: app init complete\r\n");
 }
@@ -496,7 +550,15 @@ static void App_Init(void)
 static void App_Run(void)
 {
   uint32_t now = HAL_GetTick();
+  if(wakeup_source == 1) {
+    App_Log("wakeup: by RTC\r\n");
+    wakeup_source = 0;
+  } else if(wakeup_source == 2) {
+    App_Log("wakeup: by button\r\n");
+    wakeup_source = 0;
+  }
 
+  App_HandleButton();
   App_HandleLed(now);
 
   if(adc_ready) {
@@ -509,9 +571,13 @@ static void App_Run(void)
 
     if(latest_sample.temp_ext_c_x100 > INVALID_TEMP_X100) {
       App_UpdateWearState(latest_sample.temp_ext_c_x100);
-      if(!peak_temp_valid || latest_sample.temp_ext_c_x100 > peak_temp_c_x100) {
-        peak_temp_c_x100 = latest_sample.temp_ext_c_x100;
-        peak_temp_valid = 1;
+
+      // 只有在体时才更新峰值，离体后保持峰值不变
+      if(wear_state_on_body) {
+        if(!peak_temp_valid || latest_sample.temp_ext_c_x100 > peak_temp_c_x100) {
+          peak_temp_c_x100 = latest_sample.temp_ext_c_x100;
+          peak_temp_valid = 1;
+        }
       }
     }
 
@@ -523,7 +589,7 @@ static void App_Run(void)
             (unsigned int)wear_state_on_body,
             (unsigned long)latest_sample.vbat_mv);
 #if DISPLAY_ENABLE
-  display_temp_c_x100 = App_GetDisplayTemp();
+    display_temp_c_x100 = App_GetDisplayTemp();
     App_UpdateDisplay();
 #endif
   }
@@ -533,23 +599,58 @@ static void App_Run(void)
     App_SampleAdc();
   }
 
+  if(button_short_press) {
+    button_short_press = 0;
+    HAL_GPIO_WritePin(GPIOA, POWER_CTL_Pin, GPIO_PIN_SET);
+    // 清除峰值，重新开始测量
+    peak_temp_c_x100 = INVALID_TEMP_X100;
+    peak_temp_valid = 0;
+    App_Log("button short: clear peak\r\n");
+    App_UpdateDisplay();
+  }
+
+  if(button_long_press) {
+    button_long_press = 0;
+    App_Log("power: POWER_CTL_Pin set LOW\r\n");
+    HAL_GPIO_WritePin(GPIOA, POWER_CTL_Pin, GPIO_PIN_RESET);
+    App_Log("power off by long press\r\n");
+  }
+
+  // 唤醒后5秒自动进入睡眠
   if(!adc_busy && !adc_ready && !rtc_wakeup_flag) {
-    App_EnterStopMode();
+    if((now - last_wakeup_tick) >= WAKEUP_TIMEOUT_MS) {
+      App_EnterStopMode();
+    }
   }
 }
 
 static void App_EnterStopMode(void)
 {
+  App_Log("sleep: entering stop mode\r\n");
+
+#if (APP_KEY_WAKEUP_ENABLE == 1U)
+  // 使能按键外部中断，用于唤醒Stop模式
+  HAL_NVIC_ClearPendingIRQ(EXTI0_1_IRQn);
+  HAL_NVIC_EnableIRQ(EXTI0_1_IRQn);
+#endif
+
   HAL_SuspendTick();
   HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
   SystemClock_Config();
   HAL_ResumeTick();
+
+#if (APP_KEY_WAKEUP_ENABLE == 1U)
+  // 唤醒后禁按键中断，避免重复触发
+  HAL_NVIC_DisableIRQ(EXTI0_1_IRQn);
+#endif
 }
 
 void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef* hrtc_handle)
 {
   if(hrtc_handle == &hrtc) {
     rtc_wakeup_flag = 1;
+    wakeup_source = 1;  // RTC wake-up
+    last_wakeup_tick = HAL_GetTick();
   }
 }
 
@@ -563,7 +664,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  HAL_GPIO_WritePin(GPIOA, POWER_CTL_Pin, GPIO_PIN_SET);
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -590,8 +690,12 @@ int main(void)
   MX_LPTIM1_Init();
   MX_RTC_Init();
   MX_USART2_UART_Init();
+
   /* USER CODE BEGIN 2 */
-    App_Init();
+  /* 在所有外设初始化后，设置POWER_CTL_Pin保持供电 */
+  App_Log("power: POWER_CTL_Pin set HIGH\r\n");
+  HAL_GPIO_WritePin(GPIOA, POWER_CTL_Pin, GPIO_PIN_SET);
+  App_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
