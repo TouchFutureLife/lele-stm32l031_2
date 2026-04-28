@@ -57,7 +57,8 @@ typedef struct {
 /* USER CODE BEGIN PD */
 #define APP_LED_BLINK_PERIOD_MS 1000U
 #define BUTTON_DEBOUNCE_MS 50U
-#define BUTTON_LONG_PRESS_MS 3000U
+#define BUTTON_LONG_PRESS_MS      3000U
+#define DISPLAY_TIMEOUT_MS        3000U
 #define WAKEUP_TIMEOUT_MS 60000U
 #define VREF_EXT_MV 1250U
 #define ADC_FULL_SCALE 4095U
@@ -102,10 +103,12 @@ static volatile uint8_t adc_ready = 0;
 static volatile uint8_t rtc_wakeup_flag = 0;
 static volatile uint8_t button_irq_flag = 0;
 static volatile uint8_t wakeup_source = 0; // 0=unknown, 1=RTC, 2=button
-static uint8_t button_pressed = 0;
 static uint8_t button_short_press = 0;
 static uint8_t button_long_press = 0;
-static uint32_t button_press_tick = 0;
+static uint32_t button_press_start_time = 0;  // 按键按下时间戳
+static uint8_t button_last_state = 1;        // 上次按键状态（1=高电平=释放）
+static uint8_t button_debounce_count = 0;    // 防抖计数器
+static uint8_t button_long_press_triggered = 0;  // 长按已触发标志
 
 static uint32_t last_led_toggle = 0;
 static uint32_t last_wakeup_tick = 0;
@@ -115,6 +118,8 @@ static uint8_t peak_temp_valid = 0;
 static uint8_t wear_state_on_body = 0;
 #if DISPLAY_ENABLE
 static int32_t display_temp_c_x100 = INVALID_TEMP_X100;
+static uint8_t display_on = 0;
+static uint32_t last_display_tick = 0;
 #endif
 
 /* USER CODE END PV */
@@ -476,26 +481,54 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
   }
 }
 
-static void App_HandleButton(void) {
-  if (button_irq_flag) {
-    button_irq_flag = 0;
-    if (!button_pressed) {
-      button_pressed = 1;
-      button_press_tick = HAL_GetTick();
-    }
-  }
+// 防抖计数阈值（约50ms防抖）
+#define BUTTON_DEBOUNCE_COUNT 5U
 
-  if (button_pressed) {
-    /* If released */
-    if (HAL_GPIO_ReadPin(PWRKEYIN_GPIO_Port, PWRKEYIN_Pin) == GPIO_PIN_SET) {
-      uint32_t duration = HAL_GetTick() - button_press_tick;
-      button_pressed = 0;
-      if (duration >= BUTTON_DEBOUNCE_MS) {
-        if (duration >= BUTTON_LONG_PRESS_MS) {
-          button_long_press = 1;
-        } else {
-          button_short_press = 1;
+static void App_HandleButton(void) {
+  uint8_t current_state = HAL_GPIO_ReadPin(PWRKEYIN_GPIO_Port, PWRKEYIN_Pin);
+  
+  if(current_state != button_last_state) {
+    // 增加防抖计数
+    if(++button_debounce_count >= BUTTON_DEBOUNCE_COUNT) {
+      // 防抖完成，状态稳定
+      button_last_state = current_state;
+      button_debounce_count = 0;
+      
+      if(current_state == GPIO_PIN_RESET) {
+        // 按键按下（低电平）
+        App_Log("button: pressed\r\n");
+        // 记录按下时间戳，开始计时
+        button_press_start_time = HAL_GetTick();
+        button_long_press_triggered = 0;
+      } else {
+        // 按键释放（高电平）
+        App_Log("button: released\r\n");
+        // 释放时检查是否为短按（未触发过长按）
+        if(!button_long_press_triggered && button_press_start_time > 0) {
+          uint32_t press_duration = HAL_GetTick() - button_press_start_time;
+          // 只有按下时间超过防抖时间才算有效短按
+          if(press_duration >= BUTTON_DEBOUNCE_MS) {
+            button_short_press = 1;
+            App_Log("button: short press detected (%lu ms)\r\n", press_duration);
+          }
         }
+        // 重置状态
+        button_press_start_time = 0;
+        button_long_press_triggered = 0;
+      }
+    }
+  } else {
+    // 状态未变化，重置防抖计数器
+    button_debounce_count = 0;
+    
+    // 如果按键保持按下状态，检查长按
+    if(current_state == GPIO_PIN_RESET && button_press_start_time > 0 && !button_long_press_triggered) {
+      uint32_t press_duration = HAL_GetTick() - button_press_start_time;
+      if(press_duration >= BUTTON_LONG_PRESS_MS) {
+        // 达到长按阈值，触发长按
+        button_long_press = 1;
+        button_long_press_triggered = 1;  // 设置触发标志，防止重复触发
+        App_Log("button: long press detected (%lu ms)\r\n", press_duration);
       }
     }
   }
@@ -523,6 +556,9 @@ static void App_Init(void) {
   if (SSD1315_Init() == SSD1315_OK) {
     SSD1315_Clear();
     SSD1315_Refresh_Gram();
+    SSD1315_WriteCmd(0xAF); // 打开屏幕，显示启动画面
+    display_on = 1;
+    last_display_tick = HAL_GetTick();
   }
 #endif
   /* Start an initial ADC sampling */
@@ -537,20 +573,34 @@ static void App_Init(void) {
 
 static void App_Run(void) {
   uint32_t now = HAL_GetTick();
-  if (wakeup_source == 1) {
+  if(wakeup_source == 1) {
     App_Log("wakeup: by RTC\r\n");
     // 从低功耗模式唤醒，恢复到活动模式
     App_SetPowerMode(POWER_MODE_ACTIVE);
     // 重新初始化外设
     MX_I2C1_Init();
     MX_USART2_UART_Init();
-#if DISPLAY_ENABLE
-    SSD1315_Init();
-    App_UpdateDisplay();
-#endif
+    // RTC唤醒不打开屏幕，保持低功耗
     wakeup_source = 0;
-  } else if (wakeup_source == 2) {
+  } else if(wakeup_source == 2) {
     App_Log("wakeup: by button\r\n");
+    // 重置睡眠时间计数器，重新计时
+    last_wakeup_tick = HAL_GetTick();
+    App_Log("wakeup: sleep timer reset\r\n");
+    // 清除按键中断标志，防止重复处理
+    button_irq_flag = 0;
+    // 重置按键状态，确保唤醒后按键检测从头开始
+    button_press_start_time = 0;
+    button_long_press_triggered = 0;
+    button_last_state = HAL_GPIO_ReadPin(PWRKEYIN_GPIO_Port, PWRKEYIN_Pin);
+    button_debounce_count = 0;
+    // 如果唤醒时按键仍按下，记录按下时间戳（支持长按关机）
+    if(button_last_state == GPIO_PIN_RESET) {
+      button_press_start_time = HAL_GetTick();
+      button_long_press_triggered = 0;
+      App_Log("wakeup: button pressed, starting long press timer\r\n");
+    }
+    App_Log("wakeup: button state reset\r\n");
     // 从低功耗模式唤醒，恢复到活动模式
     App_SetPowerMode(POWER_MODE_ACTIVE);
     // 重新初始化外设
@@ -558,6 +608,9 @@ static void App_Run(void) {
     MX_USART2_UART_Init();
 #if DISPLAY_ENABLE
     SSD1315_Init();
+    SSD1315_WriteCmd(0xAF);  // 打开屏幕
+    display_on = 1;
+    last_display_tick = HAL_GetTick();
     App_UpdateDisplay();
 #endif
     wakeup_source = 0;
@@ -598,7 +651,10 @@ static void App_Run(void) {
             (unsigned long)latest_sample.vbat_mv);
 #if DISPLAY_ENABLE
     display_temp_c_x100 = App_GetDisplayTemp();
-    App_UpdateDisplay();
+    // 只在屏幕打开时更新显示
+    if(display_on) {
+      App_UpdateDisplay();
+    }
 #endif
   }
 
@@ -614,7 +670,25 @@ static void App_Run(void) {
     peak_temp_c_x100 = INVALID_TEMP_X100;
     peak_temp_valid = 0;
     App_Log("button short: clear peak\r\n");
-    App_UpdateDisplay();
+    
+    // 重置睡眠时间计数器，重新计时
+    last_wakeup_tick = HAL_GetTick();
+    App_Log("button short: sleep timer reset\r\n");
+    
+#if DISPLAY_ENABLE
+    // 如果屏幕关闭，打开屏幕显示3秒
+    if(!display_on) {
+      SSD1315_WriteCmd(0xAF); // 打开OLED
+      display_on = 1;
+      last_display_tick = HAL_GetTick();
+      App_UpdateDisplay();
+      App_Log("button short: display on\r\n");
+    } else {
+      // 屏幕已打开，延长显示时间但不刷新（避免闪屏）
+      last_display_tick = HAL_GetTick();
+      App_Log("button short: display extended\r\n");
+    }
+#endif
   }
 
   if (button_long_press) {
@@ -625,20 +699,30 @@ static void App_Run(void) {
     App_SetPowerMode(POWER_MODE_SHUTDOWN);
   }
 
+// 显示超时检测：屏幕打开后3秒无操作则关闭
+#if DISPLAY_ENABLE
+  if(display_on) {
+    if((HAL_GetTick() - last_display_tick) >= DISPLAY_TIMEOUT_MS) {
+      SSD1315_WriteCmd(0xAE); // 关闭OLED
+      display_on = 0;
+      App_Log("display: timeout, turning off\r\n");
+    }
+  }
+#endif
+
   // 多级功耗管理
   if (!adc_busy && !adc_ready && !rtc_wakeup_flag) {
-    uint32_t idle_time = now - last_wakeup_tick;
-    if (idle_time >= WAKEUP_TIMEOUT_MS) {
-      // 5秒无操作，进入待机模式
-      App_SetPowerMode(POWER_MODE_STANDBY);
-    }
-    if (idle_time >= WAKEUP_TIMEOUT_MS * 2) {
-      // 10秒无操作，进入深度睡眠
-      App_SetPowerMode(POWER_MODE_SLEEP);
-    }
+    // 使用实时时间计算空闲时间，确保按键操作后立即更新
+    uint32_t idle_time = HAL_GetTick() - last_wakeup_tick;
     if (idle_time >= WAKEUP_TIMEOUT_MS * 4) {
-      // 20秒无操作，进入关机模式
+      // 240秒无操作，进入关机模式
       App_SetPowerMode(POWER_MODE_SHUTDOWN);
+    } else if (idle_time >= WAKEUP_TIMEOUT_MS * 2) {
+      // 120秒无操作，进入深度睡眠
+      App_SetPowerMode(POWER_MODE_SLEEP);
+    } else if (idle_time >= WAKEUP_TIMEOUT_MS) {
+      // 60秒无操作，进入待机模式（关闭显示）
+      App_SetPowerMode(POWER_MODE_STANDBY);
     }
   }
 }
@@ -709,14 +793,16 @@ static void App_SetPowerMode(PowerMode_t mode) {
     break;
   case POWER_MODE_STANDBY:
     // 待机模式：关闭OLED
-    // App_Log("power: entering standby mode\r\n");
+    App_Log("power: entering standby mode\r\n");
 #if DISPLAY_ENABLE
     SSD1315_WriteCmd(0xAE); // 关闭OLED
+    display_on = 0;
 #endif
     break;
   case POWER_MODE_SLEEP:
 #if DISPLAY_ENABLE
     SSD1315_WriteCmd(0xAE); // 关闭OLED
+    display_on = 0;
 #endif
     // 深度睡眠：进入Stop模式
     App_EnterStopMode();
