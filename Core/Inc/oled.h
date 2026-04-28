@@ -62,5 +62,7 @@ void SSD1315_ShowBigText(uint8_t x, uint8_t y, const char *str, uint8_t color);
 void SSD1315_FillScreen(uint8_t color);
 // Fill single page (page:0~3, color:0=black/1=white)
 void SSD1315_FillPage(uint8_t page, uint8_t color);
+// Write command to SSD1315
+void SSD1315_WriteCmd(uint8_t cmd);
 
 #endif

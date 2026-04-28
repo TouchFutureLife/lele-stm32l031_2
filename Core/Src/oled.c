@@ -27,7 +27,7 @@ static const uint8_t FONT8x16[][16] = {
 };
 
 /********************* 私有函数 *********************/
-static void SSD1315_WriteCmd(uint8_t cmd)
+void SSD1315_WriteCmd(uint8_t cmd)
 {
     HAL_StatusTypeDef status;
     uint8_t retry = 3;
